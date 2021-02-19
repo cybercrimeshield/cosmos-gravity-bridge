@@ -158,6 +158,8 @@ pub async fn main() {
             info!("Starting happy path for Gravity v2");
             happy_path_test_v2(&web30, grpc_client, &contact, keys, peggy_address, false).await;
             return;
+        } else if test_type == "ARBITRARY_LOGIC" {
+            info!("Starting arbitrary logic tests!");
         }
     }
     info!("Starting Happy path test");

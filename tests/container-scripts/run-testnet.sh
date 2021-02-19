@@ -4,6 +4,9 @@ set -eux
 BIN=peggy
 
 NODES=$1
+set +u
+TEST_TYPE=$2
+set -u
 
 for i in $(seq 1 $NODES);
 do
@@ -38,6 +41,9 @@ done
 # let the cosmos chain settle before starting eth as it
 # consumes a lot of processing power
 sleep 10
-
+if [[ $TEST_TYPE == *"ARBITRARY_LOGIC"* ]]; then
+bash /peggy/tests/container-scripts/run-eth-fork.sh &
+else
 bash /peggy/tests/container-scripts/run-eth.sh &
+fi
 sleep 10

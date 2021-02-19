@@ -255,3 +255,14 @@ func cleanupTimedOutLogicCalls(ctx sdk.Context, k keeper.Keeper) {
 		}
 	}
 }
+
+// TestingEndblocker is a second endblocker function only imported in the Gravity codebase itself
+// if you are a consuming Cosmos chain DO NOT IMPORT THIS, it simulates a chain using the arbitrary
+// logic API to request logic calls
+func TestingEndblocker(ctx sdk.Context, k keeper.Keeper) {
+	// if this is nil we have not set our outgoing logic call yet
+	if k.GetOutgoingLogicCall(ctx, []byte("GravityTesting"), 0) == nil {
+		call := types.OutgoingLogicCall{}
+		k.SetOutogingLogicCall(ctx, &call)
+	}
+}

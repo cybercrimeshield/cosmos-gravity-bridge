@@ -1,5 +1,5 @@
-use crate::utils::{get_tx_batch_nonce, GasCost};
-use clarity::PrivateKey as EthPrivateKey;
+use crate::utils::{get_logic_call_nonce, GasCost};
+use clarity::{utils::bytes_to_hex_str, PrivateKey as EthPrivateKey};
 use clarity::{Address as EthAddress, Uint256};
 use peggy_utils::error::PeggyError;
 use peggy_utils::types::*;
@@ -7,47 +7,48 @@ use std::{cmp::min, time::Duration};
 use web30::{client::Web3, types::TransactionRequest};
 
 /// this function generates an appropriate Ethereum transaction
-/// to submit the provided transaction batch
-pub async fn send_eth_transaction_batch(
+/// to submit the provided logic call
+pub async fn send_eth_logic_call(
     current_valset: Valset,
-    batch: TransactionBatch,
-    confirms: &[BatchConfirmResponse],
+    call: LogicCall,
+    confirms: &[LogicCallConfirmResponse],
     web3: &Web3,
     timeout: Duration,
     peggy_contract_address: EthAddress,
     our_eth_key: EthPrivateKey,
 ) -> Result<(), PeggyError> {
-    let new_batch_nonce = batch.nonce;
+    let new_call_nonce = call.invalidation_nonce;
     let eth_address = our_eth_key.to_public_key().unwrap();
     info!(
-        "Ordering signatures and submitting TransactionBatch {}:{} to Ethereum",
-        batch.token_contract, new_batch_nonce
+        "Ordering signatures and submitting LogicCall {}:{} to Ethereum",
+        bytes_to_hex_str(&call.invalidation_id),
+        new_call_nonce
     );
-    trace!("Batch {:?}", batch);
+    trace!("Call {:?}", call);
 
-    let before_nonce = get_tx_batch_nonce(
+    let before_nonce = get_logic_call_nonce(
         peggy_contract_address,
-        batch.token_contract,
+        call.invalidation_id.clone(),
         eth_address,
         &web3,
     )
     .await?;
     let current_block_height = web3.eth_block_number().await?;
-    if before_nonce >= new_batch_nonce {
+    if before_nonce >= new_call_nonce {
         info!(
-            "Someone else updated the batch to {}, exiting early",
+            "Someone else updated the LogicCall to {}, exiting early",
             before_nonce
         );
         return Ok(());
-    } else if current_block_height > batch.batch_timeout.into() {
+    } else if current_block_height > call.timeout.into() {
         info!(
-            "This batch is timed out. timeout block: {} current block: {}, exiting early",
-            current_block_height, batch.batch_timeout
+            "This LogicCall is timed out. timeout block: {} current block: {}, exiting early",
+            current_block_height, call.timeout
         );
         return Ok(());
     }
 
-    let payload = encode_batch_payload(current_valset, &batch, confirms)?;
+    let payload = encode_logic_call_payload(current_valset, &call, confirms)?;
 
     let tx = web3
         .send_transaction(
@@ -63,29 +64,32 @@ pub async fn send_eth_transaction_batch(
 
     web3.wait_for_transaction(tx.clone(), timeout, None).await?;
 
-    let last_nonce = get_tx_batch_nonce(
+    let last_nonce = get_logic_call_nonce(
         peggy_contract_address,
-        batch.token_contract,
+        call.invalidation_id,
         eth_address,
         &web3,
     )
     .await?;
-    if last_nonce != new_batch_nonce {
+    if last_nonce != new_call_nonce {
         error!(
             "Current nonce is {} expected to update to nonce {}",
-            last_nonce, new_batch_nonce
+            last_nonce, new_call_nonce
         );
     } else {
-        info!("Successfully updated Batch with new Nonce {:?}", last_nonce);
+        info!(
+            "Successfully updated LogicCall with new Nonce {:?}",
+            last_nonce
+        );
     }
     Ok(())
 }
 
 /// Returns the cost in Eth of sending this batch
-pub async fn estimate_tx_batch_cost(
+pub async fn estimate_logic_call_cost(
     current_valset: Valset,
-    batch: TransactionBatch,
-    confirms: &[BatchConfirmResponse],
+    call: LogicCall,
+    confirms: &[LogicCallConfirmResponse],
     web3: &Web3,
     peggy_contract_address: EthAddress,
     our_eth_key: EthPrivateKey,
@@ -104,7 +108,7 @@ pub async fn estimate_tx_batch_cost(
             gas_price: Some(gas_price.clone().into()),
             gas: Some(gas_limit.into()),
             value: Some(zero.into()),
-            data: Some(encode_batch_payload(current_valset, &batch, confirms)?.into()),
+            data: Some(encode_logic_call_payload(current_valset, &call, confirms)?.into()),
         })
         .await?;
 
@@ -114,18 +118,17 @@ pub async fn estimate_tx_batch_cost(
     })
 }
 
-/// Encodes the batch payload for both estimate_tx_batch_cost and send_eth_transaction_batch
-fn encode_batch_payload(
+/// Encodes the logic call payload for both cost estimation and submission to EThereum
+fn encode_logic_call_payload(
     current_valset: Valset,
-    batch: &TransactionBatch,
-    confirms: &[BatchConfirmResponse],
+    call: &LogicCall,
+    confirms: &[LogicCallConfirmResponse],
 ) -> Result<Vec<u8>, PeggyError> {
     let (current_addresses, current_powers) = current_valset.filter_empty_addresses();
     let current_valset_nonce = current_valset.nonce;
-    let new_batch_nonce = batch.nonce;
+    let new_call_nonce = call.invalidation_nonce;
     let sig_data = current_valset.order_sigs(confirms)?;
     let sig_arrays = to_arrays(sig_data);
-    let (amounts, destinations, fees) = batch.get_checkpoint_values();
 
     // Solidity function signature
     // function submitBatch(
@@ -137,13 +140,19 @@ fn encode_batch_payload(
     // uint8[] memory _v,
     // bytes32[] memory _r,
     // bytes32[] memory _s,
-    // // The batch of transactions
-    // uint256[] memory _amounts,
-    // address[] memory _destinations,
-    // uint256[] memory _fees,
-    // uint256 _batchNonce,
-    // address _tokenContract,
-    // uint256 _batchTimeout
+    // // The LogicCall arguments, encoded as a struct (see the Ethereum ABI encoding documentation for the handling of structs as arguments)
+    // uint256[] transferAmounts;
+    // address[] transferTokenContracts;
+    // // The fees (transferred to msg.sender)
+    // uint256[] feeAmounts;
+    // address[] feeTokenContracts;
+    // // The arbitrary logic call
+    // address logicContractAddress;
+    // bytes payload;
+    // // Invalidation metadata
+    // uint256 timeOut;
+    // bytes32 invalidationId;
+    // uint256 invalidationNonce;
     let tokens = &[
         current_addresses.into(),
         current_powers.into(),
@@ -151,15 +160,13 @@ fn encode_batch_payload(
         sig_arrays.v,
         sig_arrays.r,
         sig_arrays.s,
-        amounts,
-        destinations,
-        fees,
-        new_batch_nonce.clone().into(),
-        batch.token_contract.into(),
-        batch.batch_timeout.into(),
+        // TODO encode tuple here for a struct
     ];
-    let payload = clarity::abi::encode_call("submitBatch(address[],uint256[],uint256,uint8[],bytes32[],bytes32[],uint256[],address[],uint256[],uint256,address,uint256)",
-    tokens).unwrap();
+    let payload = clarity::abi::encode_call(
+        "submitLogicCall(address[],uint256[],uint256,uint8[],bytes32[],bytes32[],(uint256[],address[],uint256[],address[],address,bytes,uint256,bytes32,uint256))",
+        tokens,
+    )
+    .unwrap();
     trace!("Tokens {:?}", tokens);
 
     Ok(payload)
